@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  backend:
+    build: 
+      context: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+        PYTHONUNBUFFERED=1
+
+    env_file:
+      - ./backend/.env
+
+  frontend:
+    build:
+      context: ./frontend/observability-console
+    ports:
+      - "80:80"
+    depends_on:
+      - backend

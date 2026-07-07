@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+pandas
+langgraph
+langsmith
+supabase
+psycopg2-binary
+google-genai
+google-api-core
+tenacity
+python-multipart
