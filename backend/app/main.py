@@ -8,9 +8,11 @@ import uuid
 import tempfile
 import traceback
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File
+from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
 from app.services.orchestrator import orchestrator_agent
+from db import supabase_client
 
 app = FastAPI(title="Vision-Language Pipeline Gateway")
 
@@ -30,7 +32,7 @@ JOB_STORE = {}
 def health_check():
     return {"status": "healthy"}
 
-def run_agentic_pipeline(doc_id: str, file_path: str):
+def run_agentic_pipeline(doc_id: str, file_path: str, user_prompt: Optional[str] = None):
     """
     Runs the LangGraph agentic pipeline in a background thread.
     Catches any unhandled exceptions to prevent silent hangs.
@@ -40,6 +42,7 @@ def run_agentic_pipeline(doc_id: str, file_path: str):
     initial_state = {
         "document_id": doc_id,
         "file_path": file_path,
+        "user_prompt": user_prompt or None,
         "retry_count": 0,
         "max_retries": 2,
         "raw_vlm_output": None,
@@ -47,7 +50,6 @@ def run_agentic_pipeline(doc_id: str, file_path: str):
         "parsed_data": None,
         "status": "classifying"
     }
-
     try:
         final_output = orchestrator_agent.invoke(initial_state)
 
@@ -57,6 +59,7 @@ def run_agentic_pipeline(doc_id: str, file_path: str):
             "error_message": final_output.get("error_message"),
             "retries": final_output.get("retry_count", 0)
         }
+
     except Exception as e:
         # Bug Fix #3: Catch silent crashes and surface them to the status endpoint
         error_detail = traceback.format_exc()
@@ -77,10 +80,15 @@ def run_agentic_pipeline(doc_id: str, file_path: str):
                 pass
 
 @app.post("/api/v1/upload")
-async def upload_and_process(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def upload_and_process(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    prompt: Optional[str] = Form(default=None, description="Custom extraction directive for Gemini. Defaults to a comprehensive invoice extraction instruction if blank."),
+):
     """
-    Bug Fix #1 & #2: Accept real file bytes from the frontend.
-    Save them to a Docker-safe temporary file, then pass the real path to the pipeline.
+    Accepts real file bytes from the frontend via multipart/form-data.
+    Saves them to a temporary file, then launches the LangGraph pipeline
+    as a background task with the optional custom prompt.
     """
     generated_doc_id = str(uuid.uuid4())
     JOB_STORE[generated_doc_id] = {"status": "queued"}
@@ -97,9 +105,11 @@ async def upload_and_process(background_tasks: BackgroundTasks, file: UploadFile
     tmp.write(file_bytes)
     tmp.close()
 
-    print(f"[Upload] Saved uploaded file '{original_name}' to temp path: {tmp.name}")
+    print(f"[Upload] Saved '{original_name}' to temp path: {tmp.name}")
+    if prompt:
+        print(f"[Upload] Custom prompt received: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
 
-    background_tasks.add_task(run_agentic_pipeline, generated_doc_id, tmp.name)
+    background_tasks.add_task(run_agentic_pipeline, generated_doc_id, tmp.name, prompt)
 
     return {
         "message": "Pipeline initialized.",

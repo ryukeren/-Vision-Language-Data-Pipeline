@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import VideoAnalyzer from './components/VideoAnalyzer';
 import axios from 'axios';
 import {
   UploadCloud, Activity, CheckCircle, AlertTriangle, FileText,
-  RefreshCw, XCircle, Zap, Shield, Clock
+  RefreshCw, XCircle, Zap, Shield, Clock, FileVideo, AlignLeft
 } from 'lucide-react';
 
 const API_BASE = 'http://127.0.0.1:8000/api/v1';
@@ -34,8 +35,12 @@ function now() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
 }
 
+type ActiveTab = 'invoice' | 'video';
+
 export default function App() {
+  const [activeTab, setActiveTab] = useState<ActiveTab>('invoice');
   const [file, setFile]           = useState<File | null>(null);
+  const [invoicePrompt, setInvoicePrompt] = useState('Extract all billing details, line items, quantities, unit prices, taxes, and payment terms precisely.');
   const [isDragging, setIsDragging] = useState(false);
   const [docId, setDocId]         = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
@@ -75,9 +80,10 @@ export default function App() {
     try {
       pushLog(`Uploading "${file.name}" to pipeline gateway...`, 'info');
 
-      // Build a FormData payload with the actual file — no more filename-only hack
+      // Build a FormData payload with the actual file and optional prompt
       const formData = new FormData();
       formData.append('file', file);
+      if (invoicePrompt.trim()) formData.append('prompt', invoicePrompt.trim());
 
       const res = await axios.post(`${API_BASE}/upload`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
@@ -137,6 +143,32 @@ export default function App() {
   const canSubmit = !!file && !isPolling;
   const currentMeta = jobStatus ? (statusMeta[jobStatus.status] ?? statusMeta.queued) : null;
 
+  // If the video tab is active, render its dedicated component
+  if (activeTab === 'video') {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 font-sans">
+        {/* Tab switcher header for Video tab */}
+        <div className="border-b border-slate-800 bg-slate-900 sticky top-0 z-10">
+          <div className="max-w-7xl mx-auto px-6 py-3 flex items-center gap-1">
+            <button
+              onClick={() => setActiveTab('invoice')}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-all duration-150"
+            >
+              <Zap className="w-4 h-4" /> Invoice Pipeline
+            </button>
+            <button
+              onClick={() => setActiveTab('video')}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-violet-600/20 text-violet-300 border border-violet-500/30"
+            >
+              <FileVideo className="w-4 h-4" /> Video Tracker
+            </button>
+          </div>
+        </div>
+        <VideoAnalyzer />
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 font-sans flex flex-col overflow-y-auto">
 
@@ -151,6 +183,21 @@ export default function App() {
               <h1 className="text-lg font-bold text-white tracking-tight">VLP Observability Console</h1>
               <p className="text-xs text-slate-500">Vision-Language Agentic Pipeline</p>
             </div>
+          </div>
+          {/* ── Tab Switcher ──────────────────────────────────────────────── */}
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setActiveTab('invoice')}
+              className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-blue-600/20 text-blue-300 border border-blue-500/30"
+            >
+              <Zap className="w-3.5 h-3.5" /> Invoice Pipeline
+            </button>
+            <button
+              onClick={() => setActiveTab('video')}
+              className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-all duration-150"
+            >
+              <FileVideo className="w-3.5 h-3.5" /> Video Tracker
+            </button>
           </div>
           <div className="flex items-center gap-2">
             <span className="inline-flex items-center gap-1.5 text-xs text-emerald-400 bg-emerald-400/10 border border-emerald-400/20 px-3 py-1 rounded-full">
@@ -206,6 +253,28 @@ export default function App() {
                   </div>
                 </div>
               )}
+            </div>
+
+            {/* ── Analysis Prompt ─────────────────────────────────────────── */}
+            <div className="mt-4">
+              <label
+                htmlFor="invoice-prompt"
+                className="text-xs font-semibold text-slate-400 uppercase tracking-widest mb-2 flex items-center gap-1.5"
+              >
+                <AlignLeft className="w-3.5 h-3.5 text-blue-400" /> Analysis Prompt
+              </label>
+              <textarea
+                id="invoice-prompt"
+                value={invoicePrompt}
+                onChange={e => setInvoicePrompt(e.target.value)}
+                disabled={isPolling}
+                rows={3}
+                placeholder="Describe what to focus on during extraction..."
+                className={`w-full bg-slate-800/60 border border-slate-700 rounded-xl px-4 py-3 text-sm text-slate-200 placeholder-slate-600 resize-none focus:outline-none focus:border-blue-500/60 focus:ring-1 focus:ring-blue-500/30 transition-colors duration-200 ${isPolling ? 'opacity-50 cursor-not-allowed' : ''}`}
+              />
+              <p className="text-xs text-slate-600 mt-1.5">
+                Guides Gemini's extraction focus. Combined with the base system instruction.
+              </p>
             </div>
 
             <button

@@ -17,10 +17,17 @@ _RETRY_POLICY = retry(
 
 
 @_RETRY_POLICY
-def live_vlm_extract(file_path: str, error_context: str = None) -> str:
+def live_vlm_extract(file_path: str, error_context: str = None, user_prompt: str = None) -> str:
     """
     Sends an actual local image file to Gemini 2.5 Flash, 
     enforcing our strict Pydantic schema structure.
+
+    Args:
+        file_path:    Path to the local image file to analyze.
+        error_context: On a self-healing retry, the previous Pydantic error string
+                       is injected here so Gemini can correct its output.
+        user_prompt:  Optional custom extraction directive from the user. Falls back
+                      to a standard comprehensive extraction instruction if not provided.
     """
     # Read API key from Pydantic Settings (already loaded from .env at startup)
     api_key = settings.gemini_api_key
@@ -42,18 +49,25 @@ def live_vlm_extract(file_path: str, error_context: str = None) -> str:
         "and extract all structured data matching the requested JSON schema accurately."
     )
     
-    user_prompt = "Extract the invoice details."
+    # Use the custom user prompt if provided; otherwise fall back to a sensible default.
+    # This is the core of the custom prompt feature — the user's instruction becomes
+    # the primary directive that guides Gemini's extraction focus.
+    base_prompt = user_prompt.strip() if user_prompt and user_prompt.strip() \
+        else "Extract all invoice details, line items, billing information, and tax calculations precisely."
     
-    # If this is a LangGraph self-healing retry, inject the exact Pydantic error context
+    # On a LangGraph self-healing retry, append the exact Pydantic error context
+    # so Gemini knows what to fix in its next attempt.
     if error_context:
-        user_prompt += f"\n\n⚠️ Your previous attempt failed validation with this error:\n{error_context}\nFix your output based on this error."
+        final_prompt = f"{base_prompt}\n\nWARNING: Your previous attempt failed schema validation with this error:\n{error_context}\nFix your output to resolve this error."
+    else:
+        final_prompt = base_prompt
 
     try:
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=[
                 types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                user_prompt
+                final_prompt
             ],
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,

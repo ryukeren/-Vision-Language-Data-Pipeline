@@ -9,6 +9,7 @@ from db import supabase_client  # Cloud Supabase HTTPS client
 class PipelineState(TypedDict):
     document_id: str
     file_path: str
+    user_prompt: Optional[str]  # custom extraction directive from the frontend
     retry_count: int
     max_retries: int
     raw_vlm_output: Optional[str]
@@ -40,7 +41,11 @@ def guardrail_router(state: PipelineState) -> str:
 def extraction_node(state: PipelineState) -> Dict[str, Any]:
     print(f"--- [Node: Extraction] Processing Document {state['document_id']} (Attempt {state['retry_count'] + 1}) ---")
     
-    vlm_output = live_vlm_extract(file_path=state['file_path'], error_context=state.get('error_message'))
+    vlm_output = live_vlm_extract(
+        file_path=state['file_path'],
+        error_context=state.get('error_message'),
+        user_prompt=state.get('user_prompt'),   # pass custom prompt through the graph
+    )
     
     return {
         "raw_vlm_output": vlm_output,
@@ -99,6 +104,8 @@ def save_to_db_node(state: PipelineState) -> Dict[str, Any]:
         "error_message": state.get("error_message"),
         "retry_count":   state.get("retry_count", 0),
         "raw_vlm_output": state.get("raw_vlm_output"),
+        "job_type":      "invoice",
+        "prompt_used":   state.get("user_prompt"),
     }
 
     try:
