@@ -33,16 +33,21 @@ import os
 import shutil
 import tempfile
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Security, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 from pydantic import BaseModel, Field, ValidationError
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from config import settings  # reads GEMINI_API_KEY from .env via Pydantic Settings
 from db import supabase_client
@@ -92,6 +97,55 @@ class VideoTrackerReport(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 GEMINI_CLIENT: Optional[genai.Client] = None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# In-Memory Job Store
+# Holds the status and result of every video analysis job during the server's
+# lifetime. Keyed by job_id (UUID string).
+# Structure per job:
+#   { "status": "pending" | "processing" | "completed" | "failed",
+#     "result": <VideoTrackerReport dict> | None,
+#     "error":  <str> | None }
+# ─────────────────────────────────────────────────────────────────────────────
+
+jobs_db: dict = {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2b: Security — Rate Limiter + API Key Auth
+#
+# Layer 1 — SlowAPI rate limiter (5 requests / minute per client IP).
+#   Prevents spam bots from hammering the Gemini API endpoint.
+#   The limiter key is the client's IP address (get_remote_address).
+#
+# Layer 2 — X-API-Key header authentication.
+#   Only clients that present the correct APP_API_KEY secret are allowed
+#   to submit video jobs. The polling route is intentionally left open.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Rate limiter — keyed by client IP
+limiter = Limiter(key_func=get_remote_address, default_limits=[])
+
+# Header scheme: reads the raw value of the 'X-API-Key' header
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def verify_api_key(api_key: str = Security(_api_key_header)) -> str:
+    """
+    FastAPI dependency — raises 401 if the X-API-Key header is missing
+    or does not match the APP_API_KEY environment variable.
+    Apply with: dependencies=[Depends(verify_api_key)]
+    """
+    expected = settings.app_api_key
+    if not expected:
+        # No key configured on the server → auth is disabled (dev mode)
+        return "dev-mode-no-key-set"
+    if not api_key or api_key != expected:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key. Provide it via the X-API-Key header.",
+        )
+    return api_key
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,6 +204,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Wire the SlowAPI limiter into the FastAPI app
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 4b: Mount Invoice Pipeline Router
@@ -313,23 +371,92 @@ def _run_gemini_video_analysis(tmp_path: str, prompt: Optional[str]) -> VideoTra
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 7: Core Endpoint
+# SECTION 7: Background Worker
+# Runs the full Gemini pipeline in a background thread so the HTTP response
+# is returned immediately (202 Accepted) without blocking the server.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process_video_task(job_id: str, tmp_path: str, prompt: Optional[str]):
+    """
+    Background worker — runs in a FastAPI background thread.
+    Calls Gemini, validates the result, persists to Supabase, then
+    updates the in-memory jobs_db entry so the polling endpoint can
+    return the final data.
+    """
+    jobs_db[job_id]["status"] = "processing"
+    print(f"[BG:{job_id}] Worker started.")
+
+    try:
+        report = _run_gemini_video_analysis(tmp_path=tmp_path, prompt=prompt)
+
+        # Persist to Supabase
+        if supabase_client:
+            try:
+                supabase_client.table("vlp_extractions").insert({
+                    "document_id": job_id,
+                    "status": "completed",
+                    "parsed_data": report.model_dump(mode="json"),
+                    "job_type": "video",
+                    "prompt_used": prompt or "default",
+                }).execute()
+            except Exception as db_err:
+                print(f"[BG:{job_id}] DB write failed (non-fatal): {db_err}")
+
+        jobs_db[job_id] = {
+            "status": "completed",
+            "result": report.model_dump(mode="json"),
+            "error": None,
+        }
+        print(f"[BG:{job_id}] Completed successfully.")
+
+    except HTTPException as http_exc:
+        jobs_db[job_id] = {
+            "status": "failed",
+            "result": None,
+            "error": str(http_exc.detail),
+        }
+        print(f"[BG:{job_id}] Failed with HTTPException: {http_exc.detail}")
+
+    except Exception as exc:
+        jobs_db[job_id] = {
+            "status": "failed",
+            "result": None,
+            "error": f"Unexpected error: {str(exc)}",
+        }
+        print(f"[BG:{job_id}] Failed with unexpected error: {exc}")
+
+    finally:
+        # Guaranteed cleanup of the local temp file
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+                print(f"[BG:{job_id}] Deleted local temp file: '{tmp_path}'")
+            except OSError as err:
+                print(f"[BG:{job_id}] Could not delete temp file: {err}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 8: Core Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post(
     "/api/v1/analyze-video",
-    response_model=VideoTrackerReport,
     tags=["Video Analytics"],
-    summary="Upload a video and receive a structured VideoTrackerReport via Gemini cloud inference",
+    status_code=202,
+    summary="Submit a video for async analysis — returns a job_id immediately",
+    dependencies=[Depends(verify_api_key)],   # Layer 2: API key auth
     responses={
-        200: {"description": "Successful structured analysis"},
+        202: {"description": "Job accepted and queued for background processing"},
+        401: {"description": "Missing or invalid X-API-Key header"},
         415: {"description": "Unsupported file type"},
-        422: {"description": "Cloud response failed local schema validation"},
-        500: {"description": "Gemini API or internal server error"},
+        429: {"description": "Rate limit exceeded (5 requests/minute per IP)"},
         503: {"description": "Gemini client not yet initialised"},
     },
 )
+@limiter.limit("5/minute")   # Layer 1: rate limiting
 async def analyze_video(
+    request: Request,           # required by SlowAPI to resolve the client IP
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="The video file to analyze (.mp4 recommended)."),
     prompt: Optional[str] = Form(
         default=None,
@@ -337,23 +464,10 @@ async def analyze_video(
     ),
 ):
     """
-    ### POST /api/v1/analyze-video
+    ### POST /api/v1/analyze-video  →  202 Accepted
 
-    **Accepts** multipart form-data:
-    - `file` — any `.mp4`, `.mov`, `.avi`, `.mkv`, or `.webm` video file.
-    - `prompt` *(optional)* — a string to guide the model's analytical focus.
-
-    **Returns** a `VideoTrackerReport` JSON object with:
-    - `event_detected` (bool)
-    - `summary` (str)
-    - `tracked_objects` (list of label + optional timestamp + optional bounding box)
-
-    **Pipeline:**
-    1. Stream upload → local temp file (no RAM spike).
-    2. Upload temp file bytes → Gemini Files API.
-    3. Gemini 2.5 Flash runs inference with JSON schema enforcement.
-    4. Local Pydantic validation as a double-check.
-    5. Temp file + Gemini cloud file are both deleted in `finally` blocks.
+    Immediately returns a `job_id`. The Gemini pipeline runs in the background.
+    Poll `GET /api/v1/job/{job_id}` to check status and retrieve results.
     """
     # Guard: client must be ready
     if GEMINI_CLIENT is None:
@@ -365,7 +479,6 @@ async def analyze_video(
     # Validate file extension
     original_filename = file.filename or "upload.mp4"
     file_extension = os.path.splitext(original_filename)[-1].lower()
-
     SUPPORTED_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
     if file_extension not in SUPPORTED_EXTENSIONS:
         raise HTTPException(
@@ -376,60 +489,51 @@ async def analyze_video(
             ),
         )
 
-    tmp_path: Optional[str] = None
+    # Stream upload to a temp file (chunk-by-chunk, no RAM spike)
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=file_extension,
+        prefix="vlp_video_",
+    ) as tmp_file:
+        tmp_path = tmp_file.name
+        shutil.copyfileobj(file.file, tmp_file)
 
-    try:
-        # Step 1 — Stream the upload to a local temp file
-        # shutil.copyfileobj streams chunk-by-chunk, avoiding loading a
-        # large video file entirely into Python heap memory.
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=file_extension,
-            prefix="vlp_video_",
-        ) as tmp_file:
-            tmp_path = tmp_file.name
-            shutil.copyfileobj(file.file, tmp_file)
+    print(f"\n[REQUEST] Received: '{original_filename}' -> temp: '{tmp_path}'")
 
-        print(f"\n[REQUEST] Received: '{original_filename}' -> temp: '{tmp_path}'")
+    # Create a job entry in the in-memory store
+    job_id = str(uuid.uuid4())
+    jobs_db[job_id] = {"status": "pending", "result": None, "error": None}
 
-        # Step 2 — Run cloud inference and get a validated report
-        report = _run_gemini_video_analysis(tmp_path=tmp_path, prompt=prompt)
+    # Enqueue the background worker — returns immediately to the client
+    background_tasks.add_task(process_video_task, job_id, tmp_path, prompt)
 
-        # Step 2.5 — Persist to Supabase
-        if supabase_client:
-            import uuid
-            try:
-                supabase_client.table("vlp_extractions").insert({
-                    "document_id": str(uuid.uuid4()),
-                    "status": "completed",
-                    "parsed_data": report.model_dump(mode="json"),
-                    "job_type": "video",
-                    "prompt_used": prompt or "default",
-                }).execute()
-            except Exception as e:
-                print(f"[DB ERROR] Failed to save video extraction: {e}")
+    print(f"[REQUEST] Queued background job: {job_id}")
+    return JSONResponse(
+        status_code=202,
+        content={"job_id": job_id, "status": "pending"},
+    )
 
-        # Step 3 — Return the typed Pydantic model as a JSON response
-        return JSONResponse(
-            status_code=200,
-            content=report.model_dump(mode="json"),
-        )
 
-    except HTTPException:
-        raise  # Re-raise cleanly without double-wrapping
+@app.get(
+    "/api/v1/job/{job_id}",
+    tags=["Video Analytics"],
+    summary="Poll a video analysis job for its current status and result",
+    responses={
+        200: {"description": "Job status returned (pending / processing / completed / failed)"},
+        404: {"description": "No job with this ID exists"},
+    },
+)
+def get_job_status(job_id: str):
+    """
+    ### GET /api/v1/job/{job_id}
 
-    except Exception as exc:
-        print(f"[ERROR] Unexpected error: {exc}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected server error: {str(exc)}",
-        ) from exc
-
-    finally:
-        # Guaranteed cleanup of the local temp file — runs on success OR failure
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-                print(f"[CLEANUP] Deleted local temp file: '{tmp_path}'")
-            except OSError as err:
-                print(f"[WARN] Could not delete local temp file '{tmp_path}': {err}")
+    Returns the current state of the background job:
+    - `pending`    — queued but not started
+    - `processing` — Gemini API call in flight
+    - `completed`  — `result` contains the full VideoTrackerReport
+    - `failed`     — `error` contains the failure reason
+    """
+    job = jobs_db.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    return job

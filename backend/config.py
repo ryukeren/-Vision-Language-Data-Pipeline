@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     # Application
     app_env: str = "development"
     log_level: str = "INFO"
+    app_api_key: str = ""  # Set this in .env as APP_API_KEY=your-secret-key
 
 
 settings = Settings()

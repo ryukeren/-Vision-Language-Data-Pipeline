@@ -25,6 +25,7 @@ type AnalysisState =
   | { phase: 'idle' }
   | { phase: 'uploading' }
   | { phase: 'processing' }
+  | { phase: 'polling'; jobId: string; attempts: number }
   | { phase: 'success'; report: VideoTrackerReport }
   | { phase: 'error'; message: string };
 
@@ -32,7 +33,12 @@ type AnalysisState =
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VIDEO_API_URL = (import.meta.env.VITE_API_URL ?? 'http://localhost:8000') + '/api/v1/analyze-video';
+const API_BASE      = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
+const VIDEO_API_URL = `${API_BASE}/api/v1/analyze-video`;
+const JOB_URL       = (jobId: string) => `${API_BASE}/api/v1/job/${jobId}`;
+const API_KEY       = import.meta.env.VITE_API_KEY ?? '';  // set in .env.local for dev
+const POLL_INTERVAL_MS  = 3000;   // Poll every 3 s
+const MAX_POLL_ATTEMPTS = 60;     // Give up after 3 min (60 × 3 s)
 const ACCEPTED_TYPES = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm']);
 const DEFAULT_PROMPT = 'Detect and track all objects, people, and events visible in this video.';
 
@@ -61,11 +67,15 @@ function formatFileSize(bytes: number): string {
 // Sub-components
 // ─────────────────────────────────────────────────────────────────────────────
 
-function ProcessingOverlay({ phase }: { phase: 'uploading' | 'processing' }) {
-  const label = phase === 'uploading' ? 'Uploading to server...' : 'Gemini analyzing video...';
-  const sublabel = phase === 'uploading'
-    ? 'Streaming video bytes to the local API gateway.'
-    : 'Gemini 2.5 Flash is processing frames. This may take 15–60 seconds.';
+function ProcessingOverlay({ phase }: { phase: 'uploading' | 'processing' | 'polling' }) {
+  const label =
+    phase === 'uploading' ? 'Uploading to server...' :
+    phase === 'polling'   ? 'Waiting for Gemini...' :
+                           'Gemini analyzing video...';
+  const sublabel =
+    phase === 'uploading' ? 'Streaming video bytes to the API gateway.' :
+    phase === 'polling'   ? 'Polling for results every 3 s. This may take 15–60 seconds.' :
+                           'Gemini 2.5 Flash is processing frames. This may take 15–60 seconds.';
 
   return (
     <div className="flex flex-col items-center justify-center gap-5 py-12 px-6 text-center">
@@ -83,7 +93,7 @@ function ProcessingOverlay({ phase }: { phase: 'uploading' | 'processing' }) {
         <p className="text-slate-200 font-semibold text-base">{label}</p>
         <p className="text-slate-500 text-sm mt-1 max-w-xs">{sublabel}</p>
       </div>
-      {phase === 'processing' && (
+      {(phase === 'processing' || phase === 'polling') && (
         <div className="flex items-center gap-1.5 text-xs text-violet-400 bg-violet-400/10 border border-violet-400/20 px-3 py-1.5 rounded-full">
           <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-pulse" />
           Cloud inference active — gemini-2.5-flash
@@ -234,7 +244,7 @@ export default function VideoAnalyzer() {
   const [state, setState]         = useState<AnalysisState>({ phase: 'idle' });
   const fileInputRef              = useRef<HTMLInputElement>(null);
 
-  const isProcessing = state.phase === 'uploading' || state.phase === 'processing';
+  const isProcessing = state.phase === 'uploading' || state.phase === 'processing' || state.phase === 'polling';
 
   // ── File selection helpers ─────────────────────────────────────────────────
   const acceptFile = useCallback((picked: File) => {
@@ -272,12 +282,10 @@ export default function VideoAnalyzer() {
   };
 
   // ── Submit handler ─────────────────────────────────────────────────────────
-  // Uses XMLHttpRequest instead of fetch() because XHR exposes xhr.upload.onload,
-  // which fires the moment the last byte of the file is transmitted to the server.
-  // This lets us transition from 'uploading' → 'processing' immediately, without
-  // waiting for Gemini's cloud inference to complete (which can take 30–60s).
-  // fetch() only resolves after the full HTTP response is received — too late.
-  const handleSubmit = () => {
+  // Step 1: POST the file → backend returns 202 + job_id immediately.
+  // Step 2: Poll GET /api/v1/job/{job_id} every 3 s until status is
+  //         'completed' or 'failed' (or MAX_POLL_ATTEMPTS is exhausted).
+  const handleSubmit = async () => {
     if (!file || isProcessing) return;
 
     setState({ phase: 'uploading' });
@@ -286,49 +294,67 @@ export default function VideoAnalyzer() {
     formData.append('file', file);
     if (prompt.trim()) formData.append('prompt', prompt.trim());
 
-    const xhr = new XMLHttpRequest();
+    // ── Step 1: Upload the file and receive a job_id ──────────────────────
+    let jobId: string;
+    try {
+      const uploadRes = await fetch(VIDEO_API_URL, {
+        method: 'POST',
+        headers: { 'X-API-Key': API_KEY },
+        body: formData,
+      });
 
-    // ── Fires as soon as all bytes are delivered to the FastAPI server ────────
-    // At this point the server has the file and is calling the Gemini Files API.
-    // The browser is now just waiting for the response — switch state to reflect that.
-    xhr.upload.addEventListener('load', () => {
-      setState({ phase: 'processing' });
-    });
-
-    // ── Fires when the full HTTP response arrives back from the server ────────
-    xhr.addEventListener('load', () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          const report = JSON.parse(xhr.responseText) as VideoTrackerReport;
-          setState({ phase: 'success', report });
-        } catch {
-          setState({ phase: 'error', message: 'Server returned a response that could not be parsed as JSON.' });
-        }
+      if (uploadRes.status === 202) {
+        const { job_id } = await uploadRes.json();
+        jobId = job_id;
       } else {
-        try {
-          const errorBody = JSON.parse(xhr.responseText);
-          const detail = typeof errorBody.detail === 'string'
-            ? errorBody.detail
-            : JSON.stringify(errorBody.detail);
-          setState({ phase: 'error', message: `API Error ${xhr.status}: ${detail}` });
-        } catch {
-          setState({ phase: 'error', message: `API Error ${xhr.status}: ${xhr.statusText}` });
-        }
+        const body = await uploadRes.json().catch(() => ({ detail: uploadRes.statusText }));
+        const detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail);
+        setState({ phase: 'error', message: `Upload failed ${uploadRes.status}: ${detail}` });
+        return;
       }
-    });
+    } catch {
+      setState({ phase: 'error', message: 'Network error. Is the backend running?' });
+      return;
+    }
 
-    // ── Network-level failures (server offline, CORS blocked, etc.) ───────────
-    xhr.addEventListener('error', () => {
-      setState({ phase: 'error', message: 'Network error. Is the backend server running on port 8001?' });
-    });
+    // Upload is done — video is now in the background worker
+    setState({ phase: 'polling', jobId, attempts: 0 });
 
-    xhr.addEventListener('abort', () => {
-      setState({ phase: 'error', message: 'Request was cancelled.' });
-    });
+    // ── Step 2: Poll until the job finishes ───────────────────────────────
+    let attempts = 0;
+    const intervalId = setInterval(async () => {
+      attempts++;
 
-    xhr.open('POST', VIDEO_API_URL);
-    // Do NOT set Content-Type — the browser auto-sets it with the multipart boundary
-    xhr.send(formData);
+      if (attempts > MAX_POLL_ATTEMPTS) {
+        clearInterval(intervalId);
+        setState({ phase: 'error', message: 'Timed out waiting for Gemini to finish. Please try again.' });
+        return;
+      }
+
+      try {
+        const pollRes = await fetch(JOB_URL(jobId));
+        if (!pollRes.ok) {
+          clearInterval(intervalId);
+          setState({ phase: 'error', message: `Polling error ${pollRes.status}: ${pollRes.statusText}` });
+          return;
+        }
+
+        const job = await pollRes.json();
+
+        if (job.status === 'completed') {
+          clearInterval(intervalId);
+          setState({ phase: 'success', report: job.result as VideoTrackerReport });
+
+        } else if (job.status === 'failed') {
+          clearInterval(intervalId);
+          setState({ phase: 'error', message: job.error ?? 'The analysis job failed on the server.' });
+        }
+        // 'pending' or 'processing' → keep polling
+      } catch {
+        // Don't abort on a single failed poll — network hiccup, try again next tick
+        console.warn(`[Poll attempt ${attempts}] Network error, will retry...`);
+      }
+    }, POLL_INTERVAL_MS);
   };
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -529,9 +555,9 @@ export default function VideoAnalyzer() {
               </div>
             )}
 
-            {(state.phase === 'uploading' || state.phase === 'processing') && (
+            {(state.phase === 'uploading' || state.phase === 'processing' || state.phase === 'polling') && (
               <div className="flex flex-col items-center justify-center flex-1">
-                <ProcessingOverlay phase={state.phase} />
+                <ProcessingOverlay phase={state.phase === 'polling' ? 'polling' : state.phase} />
               </div>
             )}
 
