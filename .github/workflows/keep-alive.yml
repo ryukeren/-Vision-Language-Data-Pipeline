@@ -1,0 +1,50 @@
+﻿# .github/workflows/keep-alive.yml
+#
+# Supabase Keep-Alive Job
+# ========================
+# Runs every 3 days to insert a realistic mock record into `vlp_extractions`.
+# This prevents the Supabase free-tier project from being auto-paused due to
+# 7 days of inactivity.
+#
+# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#   SUPABASE_URL  — e.g. https://xxxxxxxxxxxx.supabase.co
+#   SUPABASE_KEY  — your service_role key (starts with eyJ...)
+
+name: 🗄️ Supabase Keep-Alive
+
+on:
+  schedule:
+    # Runs at 09:00 UTC every 3 days (day 1, 4, 7, 10 ... of every month)
+    - cron: "0 9 */3 * *"
+
+  # Allow manual trigger from the GitHub Actions UI
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    name: Insert Mock Extraction Record
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # 1. Check out the repository so the script is available
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Set up a lightweight Python environment
+      - name: 🐍 Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # 3. Install only the supabase client — no heavy ML deps needed
+      - name: 📦 Install dependencies
+        run: pip install supabase==2.10.0
+
+      # 4. Run the keep-alive script, injecting secrets as env vars
+      - name: 🚀 Run keep_alive.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python scripts/keep_alive.py
