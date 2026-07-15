@@ -46,6 +46,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from config import settings  # reads GEMINI_API_KEY from .env via Pydantic Settings
 from db import supabase_client
+from app.main import invoice_router  # Invoice pipeline router
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,7 +118,7 @@ async def lifespan(app: FastAPI):
 
     GEMINI_CLIENT = genai.Client(api_key=settings.gemini_api_key)
     print("[OK] Gemini API client initialised (no local GPU required).")
-    print("[OK] Model: gemini-2.5-flash  |  Port: 8001")
+    print("[OK] Model: gemini-2.5-flash  |  Invoice + Video pipelines unified")
     print("=" * 58)
 
     yield  # Server is live here
@@ -149,6 +150,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4b: Mount Invoice Pipeline Router
+# All invoice endpoints (/api/v1/upload, /api/v1/status, etc.) are served here.
+# ─────────────────────────────────────────────────────────────────────────────
+
+app.include_router(invoice_router)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

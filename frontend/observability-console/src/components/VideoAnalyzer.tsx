@@ -32,7 +32,7 @@ type AnalysisState =
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VIDEO_API_URL = 'http://localhost:8001/api/v1/analyze-video';
+const VIDEO_API_URL = (import.meta.env.VITE_API_URL ?? 'http://localhost:8000') + '/api/v1/analyze-video';
 const ACCEPTED_TYPES = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm']);
 const DEFAULT_PROMPT = 'Detect and track all objects, people, and events visible in this video.';
 

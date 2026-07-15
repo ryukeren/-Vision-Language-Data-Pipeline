@@ -1,4 +1,4 @@
-import os
+﻿import os
 from dotenv import load_dotenv
 load_dotenv()  # Inject .env into os.environ for LangSmith tracing
 
@@ -8,29 +8,26 @@ import uuid
 import tempfile
 import traceback
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File, Form
 from typing import Optional
 from app.services.orchestrator import orchestrator_agent
 from db import supabase_client
 
-app = FastAPI(title="Vision-Language Pipeline Gateway")
+# ─────────────────────────────────────────────────────────────────────────────
+# Invoice Pipeline Router
+# Mounted onto the main server.py FastAPI app via app.include_router()
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Allow React frontend to communicate with FastAPI
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict this to your frontend URL
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+invoice_router = APIRouter(tags=["Invoice Pipeline"])
 
-# In-memory store for observability (replace with Supabase in full production)
+# In-memory store for observability (keyed by document_id)
 JOB_STORE = {}
 
-@app.get("/health")
-def health_check():
-    return {"status": "healthy"}
+
+@invoice_router.get("/invoice/health")
+def invoice_health_check():
+    return {"status": "healthy", "pipeline": "invoice"}
+
 
 def run_agentic_pipeline(doc_id: str, file_path: str, user_prompt: Optional[str] = None):
     """
@@ -61,7 +58,7 @@ def run_agentic_pipeline(doc_id: str, file_path: str, user_prompt: Optional[str]
         }
 
     except Exception as e:
-        # Bug Fix #3: Catch silent crashes and surface them to the status endpoint
+        # Catch silent crashes and surface them to the status endpoint
         error_detail = traceback.format_exc()
         print(f"[PIPELINE CRASH] doc_id={doc_id}\n{error_detail}")
         JOB_STORE[doc_id] = {
@@ -79,7 +76,8 @@ def run_agentic_pipeline(doc_id: str, file_path: str, user_prompt: Optional[str]
             except Exception:
                 pass
 
-@app.post("/api/v1/upload")
+
+@invoice_router.post("/api/v1/upload")
 async def upload_and_process(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
@@ -100,7 +98,7 @@ async def upload_and_process(
     original_name = file.filename or "upload.png"
     suffix = os.path.splitext(original_name)[-1] or ".png"
 
-    # Save to a real temp file that will exist inside the Docker container filesystem
+    # Save to a real temp file that will exist inside the container filesystem
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.write(file_bytes)
     tmp.close()
@@ -117,14 +115,14 @@ async def upload_and_process(
         "status": "queued"
     }
 
+
 # Keep old JSON endpoint for backwards compatibility (local testing with filename strings)
-@app.post("/api/v1/process")
+@invoice_router.post("/api/v1/process")
 async def process_document_by_path(background_tasks: BackgroundTasks, payload: dict):
     """
     Legacy endpoint: accepts a JSON body with a 'filename' key.
     Only works when the file physically exists on the backend filesystem (local dev only).
     """
-    from pydantic import BaseModel
     filename = payload.get("filename", "")
     generated_doc_id = str(uuid.uuid4())
     JOB_STORE[generated_doc_id] = {"status": "queued"}
@@ -135,7 +133,8 @@ async def process_document_by_path(background_tasks: BackgroundTasks, payload: d
         "status": "queued"
     }
 
-@app.get("/api/v1/status/{document_id}")
+
+@invoice_router.get("/api/v1/status/{document_id}")
 def get_status(document_id: str):
     if document_id not in JOB_STORE:
         raise HTTPException(status_code=404, detail="Document ID not found.")
