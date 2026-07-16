@@ -2,7 +2,8 @@ import React, { useState, useRef, useCallback } from 'react';
 import {
   UploadCloud, FileVideo, Loader2, AlertTriangle,
   CheckCircle2, XCircle, Scan, Crosshair, Clock,
-  AlignLeft, Send, RefreshCw, Boxes
+  AlignLeft,
+  MessageSquare, Send, RefreshCw, Boxes
 } from 'lucide-react';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -18,6 +19,8 @@ interface TrackedObject {
 interface VideoTrackerReport {
   event_detected: boolean;
   summary: string;
+  custom_prompt_response?: string;
+  custom_prompt_response?: string;
   tracked_objects: TrackedObject[];
 }
 
@@ -202,13 +205,23 @@ function ReportDisplay({ report }: { report: VideoTrackerReport }) {
         </div>
       </div>
 
-      {/* Summary */}
-      <div className="bg-slate-900 rounded-xl border border-slate-800 p-4">
-        <p className="text-xs text-slate-500 uppercase tracking-wide font-semibold mb-2 flex items-center gap-1.5">
-          <AlignLeft className="w-3.5 h-3.5" /> Summary
-        </p>
-        <p className="text-slate-200 text-sm leading-relaxed">{report.summary}</p>
-      </div>
+              {/* Summary */}
+        <div className="bg-slate-900 rounded-xl border border-slate-800 p-4">
+          <p className="text-xs text-slate-500 uppercase tracking-wide font-semibold mb-2 flex items-center gap-1.5">
+            <AlignLeft className="w-3.5 h-3.5" /> Summary
+          </p>
+          <p className="text-slate-200 text-sm leading-relaxed">{report.summary}</p>
+        </div>
+
+        {/* Custom Prompt Response */}
+        {report.custom_prompt_response && (
+          <div className="bg-indigo-900/40 rounded-xl border border-indigo-500/50 p-4 shadow-inner shadow-indigo-500/10">
+            <p className="text-xs text-indigo-300 uppercase tracking-wide font-semibold mb-2 flex items-center gap-1.5">
+              <MessageSquare className="w-3.5 h-3.5" /> AI Response to Prompt
+            </p>
+            <p className="text-slate-200 text-sm leading-relaxed">{report.custom_prompt_response}</p>
+          </div>
+        )}
 
       {/* Tracked Objects Table */}
       <div className="bg-slate-900 rounded-xl border border-slate-800 p-4">

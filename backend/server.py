@@ -35,6 +35,7 @@ import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Security, UploadFile
@@ -48,6 +49,17 @@ from pydantic import BaseModel, Field, ValidationError
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+    before_sleep_log,
+    RetryError,
+)
+import logging
+
+_log = logging.getLogger(__name__)
 
 from config import settings  # reads GEMINI_API_KEY from .env via Pydantic Settings
 from db import supabase_client
@@ -86,6 +98,10 @@ class VideoTrackerReport(BaseModel):
     summary: str = Field(
         description="Concise one-to-three sentence natural language summary of the video."
     )
+    custom_prompt_response: Optional[str] = Field(
+        default=None,
+        description="Detailed text answer addressing the user\'s specific custom prompt request, if one was provided."
+    )
     tracked_objects: list[TrackedObject] = Field(
         default_factory=list,
         description="All distinct objects identified and tracked throughout the video."
@@ -109,6 +125,10 @@ GEMINI_CLIENT: Optional[genai.Client] = None
 # ─────────────────────────────────────────────────────────────────────────────
 
 jobs_db: dict = {}
+
+# Maximum number of Gemini video jobs allowed per calendar day (UTC).
+# Prevents runaway API spend on the free/low-cost tier.
+DAILY_JOB_LIMIT: int = 50
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -149,6 +169,105 @@ def verify_api_key(api_key: str = Security(_api_key_header)) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2c: Supabase DB Helpers
+# Centralised wrappers so the DB contract is defined once.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _insert_pending_job(prompt: Optional[str]) -> str:
+    """
+    Insert a new 'pending' row into vlp_extractions and return the
+    DB-generated UUID as the canonical job_id.
+    Falls back to a local UUID if Supabase is unavailable.
+    """
+    if supabase_client:
+        try:
+            result = (
+                supabase_client.table("vlp_extractions")
+                .insert({
+                    "status": "pending",
+                    "job_type": "video",
+                    "prompt_used": prompt or "default",
+                })
+                .execute()
+            )
+            row = result.data[0] if result.data else {}
+            job_id = str(row.get("id") or row.get("document_id") or uuid.uuid4())
+            print(f"[DB] Inserted pending job: {job_id}")
+            return job_id
+        except Exception as db_err:
+            print(f"[DB] Insert failed, falling back to local UUID: {db_err}")
+    # No Supabase — generate locally (dev mode)
+    return str(uuid.uuid4())
+
+
+def _update_job_status(
+    job_id: str,
+    status: str,
+    parsed_data: Optional[dict] = None,
+    raw_vlm_output: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> None:
+    """
+    Update an existing vlp_extractions row to reflect the latest job state.
+    Columns written depend on which kwargs are provided.
+    """
+    if not supabase_client:
+        return
+    payload: dict = {"status": status}
+    if parsed_data is not None:
+        payload["parsed_data"] = parsed_data
+    if raw_vlm_output is not None:
+        payload["raw_vlm_output"] = raw_vlm_output
+    if error_message is not None:
+        payload["error_message"] = error_message
+    try:
+        (
+            supabase_client.table("vlp_extractions")
+            .update(payload)
+            .eq("id", job_id)
+            .execute()
+        )
+    except Exception as db_err:
+        print(f"[DB] Status update to '{status}' failed (non-fatal): {db_err}")
+
+
+def _check_daily_budget() -> None:
+    """
+    Query Supabase for how many video jobs have reached a terminal state
+    (completed or schema_error) today (UTC).  Raises HTTPException 429
+    if DAILY_JOB_LIMIT is exceeded so callers can bail before touching
+    the Gemini API.
+    """
+    if not supabase_client:
+        return  # No DB — skip check in dev mode
+    try:
+        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        result = (
+            supabase_client.table("vlp_extractions")
+            .select("id", count="exact")
+            .eq("job_type", "video")
+            .in_("status", ["completed", "schema_error"])
+            .gte("created_at", f"{today_utc}T00:00:00Z")
+            .execute()
+        )
+        count = result.count or 0
+        print(f"[BUDGET] Today's completed video jobs: {count}/{DAILY_JOB_LIMIT}")
+        if count >= DAILY_JOB_LIMIT:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Daily budget limit of {DAILY_JOB_LIMIT} video analyses reached. "
+                    "The cap resets at midnight UTC. Please try again tomorrow."
+                ),
+            )
+    except HTTPException:
+        raise  # re-raise the budget error
+    except Exception as db_err:
+        # Don't block the job if the budget check itself fails
+        print(f"[BUDGET] Check failed (non-fatal, allowing job): {db_err}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SECTION 3: Lifespan Manager (startup / shutdown)
 #
 # Replaces the heavy model-loading lifespan from the original server.py.
@@ -164,7 +283,6 @@ async def lifespan(app: FastAPI):
     print("=" * 58)
 
     if not settings.gemini_api_key:
-        # Fail fast — no point starting the server without credentials
         raise RuntimeError(
             "GEMINI_API_KEY is not set. "
             "Please add it to backend/.env and restart the server."
@@ -173,6 +291,41 @@ async def lifespan(app: FastAPI):
     GEMINI_CLIENT = genai.Client(api_key=settings.gemini_api_key)
     print("[OK] Gemini API client initialised (no local GPU required).")
     print("[OK] Model: gemini-2.5-flash  |  Invoice + Video pipelines unified")
+
+    # ── Startup Recovery Sweep ──────────────────────────────────────────
+    # Any row still stuck at 'processing' means the previous server
+    # instance died mid-job.  We re-queue them so they are retried
+    # automatically.  tmp_path is set to '' — the worker detects this
+    # and marks the job 'failed' with a clear recovery message rather
+    # than hanging or crashing silently.
+    if supabase_client:
+        try:
+            stuck = (
+                supabase_client.table("vlp_extractions")
+                .select("id", "prompt_used")
+                .eq("status", "processing")
+                .eq("job_type", "video")
+                .execute()
+            )
+            recovered = stuck.data or []
+            if recovered:
+                print(f"[RECOVERY] Found {len(recovered)} stuck job(s) — re-queuing...")
+                for row in recovered:
+                    job_id   = str(row["id"])
+                    prompt   = row.get("prompt_used") or None
+                    # Seed in-memory store so polling works immediately
+                    jobs_db[job_id] = {"status": "processing", "result": None, "error": None}
+                    # Re-queue with sentinel path '' — worker will detect and fail gracefully
+                    from fastapi import BackgroundTasks as _BT
+                    bt = _BT()
+                    bt.add_task(process_video_task, job_id, "", prompt)
+                    await bt()
+                    print(f"[RECOVERY] Re-queued job: {job_id}")
+            else:
+                print("[RECOVERY] No stuck jobs found.")
+        except Exception as sweep_err:
+            print(f"[RECOVERY] Sweep failed (non-fatal): {sweep_err}")
+
     print("=" * 58)
 
     yield  # Server is live here
@@ -309,34 +462,49 @@ def _run_gemini_video_analysis(tmp_path: str, prompt: Optional[str]) -> VideoTra
         if prompt:
             user_prompt += f"\n\nAdditional focus: {prompt}"
 
-        # Step 4 — Call Gemini with cloud-side schema enforcement
-        # response_mime_type="application/json" + response_schema=VideoTrackerReport
-        # instructs Gemini to constrain its token sampling to valid JSON matching
-        # our Pydantic schema — the cloud does the JSON heavy lifting for us.
-        print("[INFERENCE] Sending to Gemini 2.5 Flash...")
-        response = GEMINI_CLIENT.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                types.Part.from_uri(
-                    file_uri=uploaded_file.uri,
-                    mime_type="video/mp4",
-                ),
-                user_prompt,
-            ],
-            config=types.GenerateContentConfig(
-                system_instruction=base_instruction,
-                response_mime_type="application/json",
-                response_schema=VideoTrackerReport,
-                temperature=0.1,
-            ),
-        )
+        # Step 4 — Call Gemini with cloud-side schema enforcement.
+        # Wrapped in a tenacity @retry inner function so transient rate-limit
+        # (429) and server errors (5xx) are automatically retried with
+        # exponential backoff before the job is marked as failed.
+        def _is_retriable(exc: BaseException) -> bool:
+            """Return True for transient Gemini errors worth retrying."""
+            if isinstance(exc, APIError):
+                code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+                if code in (429, 500, 502, 503, 504):
+                    return True
+            return False
 
-        raw_json: str = response.text
+        @retry(
+            retry=retry_if_exception(_is_retriable),
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=2, max=30),
+            before_sleep=before_sleep_log(_log, logging.WARNING),
+            reraise=True,
+        )
+        def _call_gemini_with_retry() -> str:
+            print("[INFERENCE] Sending to Gemini 2.5 Flash...")
+            resp = GEMINI_CLIENT.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    types.Part.from_uri(
+                        file_uri=uploaded_file.uri,
+                        mime_type="video/mp4",
+                    ),
+                    user_prompt,
+                ],
+                config=types.GenerateContentConfig(
+                    system_instruction=base_instruction,
+                    response_mime_type="application/json",
+                    response_schema=VideoTrackerReport,
+                    temperature=0.1,
+                ),
+            )
+            return resp.text
+
+        raw_json: str = _call_gemini_with_retry()
         print(f"[INFERENCE] Response received ({len(raw_json)} chars).")
 
-        # Step 5 — Local double-check validation
-        # Even though Gemini enforces the schema cloud-side, we validate locally
-        # to catch any edge-case drift and get a fully-typed Python object.
+        # Step 5 � Local double-check validation
         try:
             report = VideoTrackerReport.model_validate_json(raw_json)
             print("[VALID] Local Pydantic validation passed.")
@@ -500,8 +668,9 @@ async def analyze_video(
 
     print(f"\n[REQUEST] Received: '{original_filename}' -> temp: '{tmp_path}'")
 
-    # Create a job entry in the in-memory store
-    job_id = str(uuid.uuid4())
+    # Insert a 'pending' row into Supabase and use the DB-generated UUID
+    # as the canonical job_id.  This makes the queue durable across restarts.
+    job_id = _insert_pending_job(prompt)
     jobs_db[job_id] = {"status": "pending", "result": None, "error": None}
 
     # Enqueue the background worker — returns immediately to the client
@@ -528,12 +697,35 @@ def get_job_status(job_id: str):
     ### GET /api/v1/job/{job_id}
 
     Returns the current state of the background job:
-    - `pending`    — queued but not started
-    - `processing` — Gemini API call in flight
-    - `completed`  — `result` contains the full VideoTrackerReport
-    - `failed`     — `error` contains the failure reason
+    - `pending`      — queued but not started
+    - `processing`   — Gemini API call in flight
+    - `completed`    — `result` contains the full VideoTrackerReport
+    - `schema_error` — Gemini output failed validation; debug file saved
+    - `failed`       — `error` contains the failure reason
     """
+    # 1. Fast path: in-memory store (job is live in this process)
     job = jobs_db.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
-    return job
+    if job is not None:
+        return job
+
+    # 2. Fallback: query Supabase (job survived a restart or was never in RAM)
+    if supabase_client:
+        try:
+            result = (
+                supabase_client.table("vlp_extractions")
+                .select("id", "status", "parsed_data", "raw_vlm_output", "error_message")
+                .eq("id", job_id)
+                .single()
+                .execute()
+            )
+            row = result.data
+            if row:
+                return {
+                    "status": row.get("status", "unknown"),
+                    "result": row.get("parsed_data"),
+                    "error":  row.get("error_message"),
+                }
+        except Exception:
+            pass  # Fall through to 404
+
+    raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
